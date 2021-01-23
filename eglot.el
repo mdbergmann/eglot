@@ -2522,16 +2522,32 @@ is not active."
    current-prefix-arg))
 
 
-(defun eglot-code-actions (beg &optional end)
-  "Offer to execute code actions between BEG and END.
-Interactively, if a region is active, BEG and END are its bounds,
-else BEG is point and END is nil, which results in a request for
-code actions at point"
+(defun eglot-code-actions (beg &optional end action-kind)
+  "Offer to execute ACTION-KIND code actions between BEG and END.
+Interactively or when BEG is nil, if a region is active, BEG and END are its
+bounds, else BEG is point and END is nil, which results in a request for
+code actions at point.
+When called interactively with universal prefix argument, prompts for action
+kind."
   (interactive
-   (if (region-active-p) `(,(region-beginning) ,(region-end)) `(,(point) nil)))
+   `(nil nil ,(when current-prefix-arg
+                (completing-read "[eglot] Action kind: "
+                                 '("quickfix"
+                                   "refactor.extract"
+                                   "refactor.inline"
+                                   "refactor.rewrite"
+                                   "source.organizeImports")))))
   (unless (eglot--server-capable :codeActionProvider)
     (eglot--error "Server can't execute code actions!"))
   (let* ((server (eglot--current-server-or-lose))
+         (end (if beg
+                  end
+                (when (region-active-p)
+                  (region-end))))
+         (beg (or beg
+                  (if (region-active-p)
+                      (region-beginning)
+                    (point))))
          (actions
           (jsonrpc-request
            server
@@ -2540,29 +2556,46 @@ code actions at point"
                  :range (list :start (eglot--pos-to-lsp-position beg)
                               :end (eglot--pos-to-lsp-position end))
                  :context
-                 `(:diagnostics
-                   [,@(cl-loop for diag in (flymake-diagnostics beg end)
-                               when (cdr (assoc 'eglot-lsp-diag (eglot--diag-data diag)))
-                               collect it)]))))
+                 (append
+                  `(:diagnostics
+                    [,@(cl-loop for diag in (flymake-diagnostics beg end)
+                                when (cdr (assoc 'eglot-lsp-diag
+                                                 (eglot--diag-data diag)))
+                                collect it)])
+                  (when action-kind
+                    `(:only ,action-kind))))))
          (menu-items
-          (or (mapcar (jsonrpc-lambda (&rest all &key title &allow-other-keys)
-                        (cons title all))
-                      actions)
-              (eglot--error "No code actions here")))
+          (or (cl-remove-if-not
+               #'identity
+               (mapcar (jsonrpc-lambda (&rest all &key title kind
+                                              &allow-other-keys)
+                         (when (or (not action-kind)
+                                   (equal action-kind kind))
+                           (cons title all)))
+                       actions))
+              (eglot--error (if action-kind "No \"%s\" code actions here"
+                              "No code actions here")
+                            action-kind)))
          (preferred-action (cl-find-if
-                            (jsonrpc-lambda (&key isPreferred &allow-other-keys)
-                              isPreferred)
+                            (jsonrpc-lambda (&key isPreferred kind
+                                                  &allow-other-keys)
+                              (and isPreferred
+                                   (or (not action-kind)
+                                       (equal action-kind kind))))
                             actions))
-         (menu `("Eglot code actions:" ("dummy" ,@menu-items)))
-         (action (if (listp last-nonmenu-event)
-                     (x-popup-menu last-nonmenu-event menu)
-                   (cdr (assoc (completing-read "[eglot] Pick an action: "
-                                                menu-items nil t
-                                                nil nil (or (plist-get
-                                                             preferred-action
-                                                             :title)
-                                                            (car menu-items)))
-                               menu-items)))))
+         (action (if (and action-kind (= 1 (length menu-items)))
+                     (cdr (car menu-items))
+                   (if (listp last-nonmenu-event)
+                       (x-popup-menu
+                        last-nonmenu-event
+                        `("Eglot code actions:" ("dummy" ,@menu-items)))
+                     (cdr (assoc (completing-read "[eglot] Pick an action: "
+                                                  menu-items nil t
+                                                  nil nil (or (plist-get
+                                                               preferred-action
+                                                               :title)
+                                                              (car menu-items)))
+                                 menu-items))))))
     (eglot--dcase action
       (((Command) command arguments)
        (eglot-execute-command server (intern command) arguments))
